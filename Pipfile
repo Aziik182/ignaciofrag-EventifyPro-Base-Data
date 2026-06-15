@@ -12,6 +12,8 @@ flask-cors = "*"
 flask-bcrypt = "*"
 python-dotenv = "*"
 pytz = "*"
+argon2-cffi = "*"
+flask-limiter = "*"
 
 [dev-packages]
 
