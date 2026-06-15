@@ -64,8 +64,9 @@ class Service(db.Model):
     name = db.Column(db.String(200), nullable=False)
     type = db.Column(db.String(50), nullable=False)
     price = db.Column(db.Float)
+    pricing_type = db.Column(db.String(50), nullable=True, default='por evento')
     description = db.Column(db.Text)
-    location = db.Column(db.String(200))  # Añadir este campo
+    location = db.Column(db.String(200))
     profile_id = db.Column(db.Integer, db.ForeignKey('profile.id'))
 
     profile = db.relationship('Profile', back_populates='services')
@@ -162,9 +163,8 @@ class Event(db.Model):
     user = db.relationship('User', back_populates='events')
     created_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
 
-
-def __repr__(self):
-    return f'<Event {self.name}>'
+    def __repr__(self):
+        return f'<Event {self.name}>'
 
 
     # test
