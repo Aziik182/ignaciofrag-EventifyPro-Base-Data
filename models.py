@@ -12,6 +12,16 @@ class TokenBlocklist(db.Model):
     created_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc))
 
 
+class PasswordResetToken(db.Model):
+    __tablename__ = 'password_reset_token'
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    token_hash = db.Column(db.String(64), nullable=False, unique=True, index=True)
+    expires_at = db.Column(db.DateTime, nullable=False)
+    used_at = db.Column(db.DateTime, nullable=True)
+    created_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc))
+
+
 class User(db.Model):
     __tablename__ = 'user'
     id = db.Column(db.Integer, primary_key=True)
@@ -19,7 +29,8 @@ class User(db.Model):
     email = db.Column(db.String(200), nullable=False, unique=True)
     first_name = db.Column(db.String(100), nullable=False)
     last_name = db.Column(db.String(100), nullable=False)
-    
+    password_changed_at = db.Column(db.DateTime, nullable=True)
+
     profile = db.relationship('Profile', backref='user', uselist=False)
     tickets = db.relationship('SupportTicket', backref='user')
     reviews = db.relationship('Review', backref='user')
@@ -136,6 +147,7 @@ class Reservation(db.Model):
     precio = db.Column(db.Float, nullable=False)
     proveedor_id = db.Column(db.Integer, db.ForeignKey('profile.id'), nullable=False)
     paquete_evento_id = db.Column(db.Integer, db.ForeignKey('event_pack.id'), nullable=True)
+    event_id = db.Column(db.Integer, db.ForeignKey('events.id'), nullable=True)
     usuario_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
     service_id = db.Column(db.Integer, db.ForeignKey('service.id'), nullable=False)
     created_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
@@ -144,6 +156,7 @@ class Reservation(db.Model):
     user = db.relationship('User', back_populates='reservations')
     proveedor = db.relationship('Profile', foreign_keys=[proveedor_id], back_populates='reservations_as_proveedor')
     event_pack = db.relationship('EventPack', foreign_keys=[paquete_evento_id], back_populates='reservations_as_event_pack')
+    event = db.relationship('Event', foreign_keys=[event_id])
 
 
 

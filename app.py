@@ -1,10 +1,14 @@
 import os
 import logging
+import secrets
+import hashlib
+import smtplib
+from email.message import EmailMessage
 from flask import Flask, request, jsonify
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from flask_cors import CORS
 from sqlalchemy.exc import IntegrityError
-from models import db, User, Profile, Service, Event, EventPack, Reservation, ReservationStatus, TokenBlocklist
+from models import db, User, Profile, Service, Event, EventPack, Reservation, ReservationStatus, TokenBlocklist, PasswordResetToken
 from flask_sqlalchemy import SQLAlchemy
 from flask_migrate import Migrate
 from flask_jwt_extended import (
@@ -52,6 +56,9 @@ limiter = Limiter(
 _cors_origins = os.getenv("CORS_ORIGINS", "http://localhost:3000").split(",")
 CORS(app, resources={r"/*": {"origins": _cors_origins}}, supports_credentials=True)
 
+FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:3000")
+PASSWORD_RESET_TOKEN_TTL = timedelta(hours=1)
+
 # ── Argon2id password helpers ───────────────────────────────────────────────
 _ph = PasswordHasher()
 
@@ -74,9 +81,58 @@ def verify_password(stored: str, provided: str) -> bool:
 @jwt.token_in_blocklist_loader
 def check_if_token_revoked(jwt_header, jwt_payload):
     jti = jwt_payload['jti']
-    return db.session.execute(
+    if db.session.execute(
         db.select(TokenBlocklist).filter_by(jti=jti)
-    ).scalar_one_or_none() is not None
+    ).scalar_one_or_none() is not None:
+        return True
+
+    # Tokens issued before the user's last password change/reset are no longer valid,
+    # even if they haven't individually been blocklisted (e.g. other active sessions).
+    user_id = jwt_payload.get('sub')
+    if user_id is None:
+        return False
+    user = db.session.get(User, int(user_id))
+    if not user or not user.password_changed_at:
+        return False
+    changed_at = user.password_changed_at
+    if changed_at.tzinfo is None:
+        changed_at = changed_at.replace(tzinfo=timezone.utc)
+    # jwt 'iat' has whole-second precision, so truncate changed_at the same way —
+    # otherwise a token minted in the same second as the change (e.g. logout-all
+    # re-issuing cookies right after bumping password_changed_at) would be born revoked.
+    changed_at = changed_at.replace(microsecond=0)
+    issued_at = datetime.fromtimestamp(jwt_payload['iat'], tz=timezone.utc)
+    return issued_at < changed_at
+
+
+# ── Password reset email ────────────────────────────────────────────────────
+def send_password_reset_email(to_email: str, reset_link: str) -> None:
+    smtp_host = os.getenv('SMTP_HOST')
+    if not smtp_host:
+        logger.info("SMTP not configured. Password reset link for %s: %s", to_email, reset_link)
+        return
+    smtp_port = int(os.getenv('SMTP_PORT', '587'))
+    smtp_user = os.getenv('SMTP_USER')
+    smtp_password = os.getenv('SMTP_PASSWORD')
+    smtp_from = os.getenv('SMTP_FROM', smtp_user)
+
+    msg = EmailMessage()
+    msg['Subject'] = 'Recupera tu contraseña - EventifyPro'
+    msg['From'] = smtp_from
+    msg['To'] = to_email
+    msg.set_content(
+        "Recibimos una solicitud para restablecer tu contraseña.\n\n"
+        f"Haz clic en el siguiente link (válido por 1 hora):\n{reset_link}\n\n"
+        "Si no solicitaste esto, puedes ignorar este correo."
+    )
+    try:
+        with smtplib.SMTP(smtp_host, smtp_port, timeout=10) as server:
+            server.starttls()
+            if smtp_user and smtp_password:
+                server.login(smtp_user, smtp_password)
+            server.send_message(msg)
+    except Exception as e:
+        logger.error("Failed to send password reset email to %s: %s", to_email, e)
 
 
 def parse_json_body():
@@ -217,6 +273,80 @@ def logout():
     return resp, 200
 
 
+@app.route('/auth/forgot-password', methods=['POST'])
+@limiter.limit("5 per minute")
+def forgot_password():
+    data = parse_json_body() or {}
+    email = data.get('email')
+    generic_response = jsonify({"msg": "Si el email existe, se enviará un link de recuperación"})
+
+    if not email:
+        return generic_response, 200
+
+    user = User.query.filter_by(email=email).first()
+    if not user:
+        return generic_response, 200
+
+    try:
+        raw_token = secrets.token_urlsafe(32)
+        token_hash = hashlib.sha256(raw_token.encode()).hexdigest()
+        reset_token = PasswordResetToken(
+            user_id=user.id,
+            token_hash=token_hash,
+            expires_at=datetime.now(timezone.utc) + PASSWORD_RESET_TOKEN_TTL,
+        )
+        db.session.add(reset_token)
+        db.session.commit()
+
+        reset_link = f"{FRONTEND_URL}/reset-password?token={raw_token}"
+        send_password_reset_email(user.email, reset_link)
+    except Exception as e:
+        db.session.rollback()
+        logger.error("Error generating password reset token for %s: %s", email, e)
+
+    return generic_response, 200
+
+
+@app.route('/auth/reset-password', methods=['POST'])
+@limiter.limit("10 per minute")
+def reset_password():
+    data = parse_json_body() or {}
+    raw_token = data.get('token')
+    new_password = data.get('newPassword')
+
+    if not raw_token or not new_password:
+        return jsonify({"msg": "Token y nueva contraseña son requeridos"}), 400
+
+    token_hash = hashlib.sha256(raw_token.encode()).hexdigest()
+    reset_token = PasswordResetToken.query.filter_by(token_hash=token_hash).first()
+    if not reset_token:
+        return jsonify({"msg": "Token inválido o expirado"}), 400
+
+    if reset_token.used_at is not None:
+        return jsonify({"msg": "Token inválido o expirado"}), 400
+
+    expires_at = reset_token.expires_at
+    if expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=timezone.utc)
+    if expires_at < datetime.now(timezone.utc):
+        return jsonify({"msg": "Token inválido o expirado"}), 400
+
+    user = db.session.get(User, reset_token.user_id)
+    if not user:
+        return jsonify({"msg": "Token inválido o expirado"}), 400
+
+    try:
+        now = datetime.now(timezone.utc)
+        user.password = hash_password(new_password)
+        user.password_changed_at = now
+        reset_token.used_at = now
+        db.session.commit()
+        return jsonify({"msg": "Contraseña actualizada correctamente"}), 200
+    except Exception as e:
+        db.session.rollback()
+        logger.error("Error resetting password for user %s: %s", reset_token.user_id, e)
+        return jsonify({"msg": "Error al actualizar la contraseña"}), 500
+
 
 @app.route('/user/me', methods=['GET'])
 @jwt_required()
@@ -289,6 +419,7 @@ def update_user(user_id):
             if new_password != confirm_password:
                 return jsonify({"msg": "Las nuevas contraseñas no coinciden"}), 400
             user.password = hash_password(new_password)
+            user.password_changed_at = datetime.now(timezone.utc)
 
         if 'profile' in data:
             user.profile.phone_number = data['profile'].get('phone_number', user.profile.phone_number)
@@ -307,6 +438,148 @@ def update_user(user_id):
         db.session.rollback()
         logger.error("Error updating user %s: %s", user_id, e)
         return jsonify({"msg": "Error updating user"}), 500
+
+
+########################## CUENTA / PERFIL (endpoints divididos) ##########
+@app.route('/me', methods=['GET'])
+@jwt_required()
+def get_me():
+    user_id = int(get_jwt_identity())
+    user = db.session.get(User, user_id)
+    if not user:
+        return jsonify({"msg": "User not found"}), 404
+    return jsonify(_user_info(user)), 200
+
+
+@app.route('/me/profile', methods=['PATCH'])
+@jwt_required()
+def update_my_profile():
+    user_id = int(get_jwt_identity())
+    user = db.session.get(User, user_id)
+    if not user:
+        return jsonify({"msg": "User not found"}), 404
+    data = parse_json_body() or {}
+    try:
+        user.first_name = data.get('first_name', user.first_name)
+        user.last_name = data.get('last_name', user.last_name)
+        user.profile.phone_number = data.get('phone_number', user.profile.phone_number)
+        user.profile.address = data.get('address', user.profile.address)
+        db.session.commit()
+        return jsonify({"msg": "Profile updated successfully", "user": _user_info(user)}), 200
+    except Exception as e:
+        db.session.rollback()
+        logger.error("Error updating profile for user %s: %s", user_id, e)
+        return jsonify({"msg": "Error updating profile"}), 500
+
+
+@app.route('/me/provider-profile', methods=['PATCH'])
+@jwt_required()
+def update_my_provider_profile():
+    user_id = int(get_jwt_identity())
+    user = db.session.get(User, user_id)
+    if not user:
+        return jsonify({"msg": "User not found"}), 404
+    if user.profile.role != 'Proveedor':
+        return jsonify({"msg": "Unauthorized"}), 403
+    data = parse_json_body() or {}
+    try:
+        user.profile.company_name = data.get('company_name', user.profile.company_name)
+        user.profile.url_portfolio = data.get('url_portfolio', user.profile.url_portfolio)
+        user.profile.description = data.get('description', user.profile.description)
+        db.session.commit()
+        return jsonify({"msg": "Business profile updated successfully", "user": _user_info(user)}), 200
+    except Exception as e:
+        db.session.rollback()
+        logger.error("Error updating provider profile for user %s: %s", user_id, e)
+        return jsonify({"msg": "Error updating business profile"}), 500
+
+
+@app.route('/me/account/email', methods=['PATCH'])
+@jwt_required()
+def update_my_email():
+    user_id = int(get_jwt_identity())
+    user = db.session.get(User, user_id)
+    if not user:
+        return jsonify({"msg": "User not found"}), 404
+    data = parse_json_body() or {}
+    new_email = data.get('new_email')
+    current_password = data.get('current_password')
+
+    if not new_email or not current_password:
+        return jsonify({"msg": "Email y contraseña actual son requeridos"}), 400
+    if not verify_password(user.password, current_password):
+        return jsonify({"msg": "Contraseña actual incorrecta"}), 400
+    if new_email == user.email:
+        return jsonify({"msg": "Email updated successfully", "user": _user_info(user)}), 200
+    if User.query.filter(User.email == new_email, User.id != user_id).first():
+        return jsonify({"msg": "El email ya está en uso"}), 409
+
+    try:
+        user.email = new_email
+        db.session.commit()
+        return jsonify({"msg": "Email updated successfully", "user": _user_info(user)}), 200
+    except IntegrityError as e:
+        db.session.rollback()
+        logger.warning("Integrity error updating email for user %s: %s", user_id, e)
+        return jsonify({"msg": "El email ya está en uso"}), 409
+    except Exception as e:
+        db.session.rollback()
+        logger.error("Error updating email for user %s: %s", user_id, e)
+        return jsonify({"msg": "Error updating email"}), 500
+
+
+@app.route('/me/account/change-password', methods=['POST'])
+@jwt_required()
+def change_my_password():
+    user_id = int(get_jwt_identity())
+    user = db.session.get(User, user_id)
+    if not user:
+        return jsonify({"msg": "User not found"}), 404
+    data = parse_json_body() or {}
+    current_password = data.get('current_password')
+    new_password = data.get('new_password')
+    confirm_password = data.get('confirm_password')
+
+    if not current_password or not new_password:
+        return jsonify({"msg": "Se requiere la contraseña actual y la nueva"}), 400
+    if not verify_password(user.password, current_password):
+        return jsonify({"msg": "Contraseña actual incorrecta"}), 400
+    if new_password != confirm_password:
+        return jsonify({"msg": "Las nuevas contraseñas no coinciden"}), 400
+
+    try:
+        user.password = hash_password(new_password)
+        user.password_changed_at = datetime.now(timezone.utc)
+        db.session.commit()
+        return jsonify({"msg": "Contraseña actualizada correctamente"}), 200
+    except Exception as e:
+        db.session.rollback()
+        logger.error("Error changing password for user %s: %s", user_id, e)
+        return jsonify({"msg": "Error al actualizar la contraseña"}), 500
+
+
+@app.route('/me/security/logout-all', methods=['POST'])
+@jwt_required()
+def logout_all_other_sessions():
+    user_id = int(get_jwt_identity())
+    user = db.session.get(User, user_id)
+    if not user:
+        return jsonify({"msg": "User not found"}), 404
+    try:
+        user.password_changed_at = datetime.now(timezone.utc)
+        db.session.commit()
+        # Re-issue fresh tokens so the current device stays logged in
+        # while every other previously-issued token becomes invalid.
+        new_access = create_access_token(identity=str(user_id))
+        new_refresh = create_refresh_token(identity=str(user_id))
+        resp = jsonify({"msg": "Se cerraron todas las otras sesiones"})
+        set_access_cookies(resp, new_access)
+        set_refresh_cookies(resp, new_refresh)
+        return resp, 200
+    except Exception as e:
+        db.session.rollback()
+        logger.error("Error logging out other sessions for user %s: %s", user_id, e)
+        return jsonify({"msg": "Error al cerrar las otras sesiones"}), 500
 
 
 ########################### SERVICIOS #####################################
@@ -581,6 +854,13 @@ def create_reservation():
             return jsonify({"msg": "Event pack not found"}), 404
         if event_pack.provider_id != service.profile_id:
             return jsonify({"msg": "Event pack does not belong to the same provider as the service"}), 400
+    event_id = data.get('event_id')
+    if event_id is not None:
+        event = db.session.get(Event, event_id)
+        if not event:
+            return jsonify({"msg": "Event not found"}), 404
+        if event.user_id != user_id:
+            return jsonify({"msg": "Event does not belong to the requesting user"}), 403
     try:
         reservation = Reservation(
             status=ReservationStatus.PENDING,
@@ -588,6 +868,7 @@ def create_reservation():
             precio=service.price,  # price always comes from the service, never from the client
             proveedor_id=data['proveedor_id'],
             paquete_evento_id=paquete_evento_id,
+            event_id=event_id,
             usuario_id=user_id,
             service_id=data['service_id'],
         )
@@ -618,6 +899,7 @@ def get_all_reservations():
         "precio": r.precio,
         "proveedor_id": r.proveedor_id,
         "paquete_evento_id": r.paquete_evento_id,
+        "event_id": r.event_id,
         "usuario_id": r.usuario_id,
         "service_id": r.service_id,
         "created_at": r.created_at.isoformat(),
@@ -651,6 +933,8 @@ def get_user_reservations(user_id):
             "address": provider_profile.address,
             "service_name": service.name,
             "service_type": service.type,
+            "event_name": r.event.name if r.event else None,
+            "event_type": r.event.eventype if r.event else None,
             "created_at": r.created_at.isoformat(),
         })
     return jsonify(reservations_list), 200
@@ -679,6 +963,9 @@ def get_provider_reservations(provider_id):
             "client_name": f"{client.first_name} {client.last_name}",
             "client_email": client.email,
             "client_phone": client.profile.phone_number if client.profile else None,
+            "event_name": r.event.name if r.event else None,
+            "event_type": r.event.eventype if r.event else None,
+            "event_guests": r.event.guests if r.event else None,
             "created_at": r.created_at.isoformat(),
         })
     return jsonify(reservations_list), 200
